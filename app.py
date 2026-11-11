@@ -1,263 +1,250 @@
-import streamlit as st
+from collections import Counter
+from contextlib import closing
+from datetime import datetime, timedelta
+
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import sqlite3
-import os
+import streamlit as st
 
-# Konfigurasi Halaman Streamlit
-st.set_page_config(
-    page_title="Pencatat Gangguan Wi-Fi PTS Kost",
-    page_icon="📶",
-    layout="wide"
-)
+from database import get_connection, init_db, insert_complaint
+from diagnostics import DIAGNOSES, display_status
+from incidents import GAP_SECONDS, MIN_DOWNTIME_SECONDS, analyze_samples
+from monitor import BACKUP_TARGET, INTERNET_TARGET, ROUTER_IP
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "wifi_log.db")
+st.set_page_config(page_title="Pemantauan Wi-Fi PTS Kost", page_icon="📶", layout="wide")
 
-def load_data():
-    """Mengambil data log ping dan keluhan dari SQLite."""
-    if not os.path.exists(DB_PATH):
-        return pd.DataFrame(), pd.DataFrame()
-    
-    conn = sqlite3.connect(DB_PATH)
-    
-    # 1. Baca Ping Logs
-    query_ping = "SELECT * FROM ping_logs ORDER BY timestamp ASC"
-    df_ping = pd.read_sql_query(query_ping, conn)
-    
-    # 2. Baca Complaints
-    query_comp = "SELECT * FROM complaints ORDER BY timestamp DESC"
-    df_comp = pd.read_sql_query(query_comp, conn)
-    
-    conn.close()
-    
-    if not df_ping.empty:
-        df_ping['timestamp'] = pd.to_datetime(df_ping['timestamp'])
-    if not df_comp.empty:
-        df_comp['timestamp'] = pd.to_datetime(df_comp['timestamp'])
-        
-    return df_ping, df_comp
 
-def group_incidents(df_ping, gap_threshold_sec=15):
-    """
-    Mengelompokkan deretan ping bermasalah menjadi satu 'Insiden Kejadian'.
-    Membedakan laptop mati (jeda > 15 detik) vs gangguan jaringan.
-    """
-    if df_ping.empty:
-        return []
-    
-    incidents = []
-    current_incident = None
-    
-    for i in range(len(df_ping)):
-        row = df_ping.iloc[i]
-        status = row['status']
-        ts = row['timestamp']
-        
-        # Cek jika ada jeda karena laptop mati (> 15 detik antar pembacaan berurutan)
-        if i > 0:
-            delta = (ts - df_ping.iloc[i-1]['timestamp']).total_seconds()
-            if delta > gap_threshold_sec and current_incident is not None:
-                # Tutup insiden sebelumnya karena ada jeda pemantauan
-                current_incident['end_time'] = df_ping.iloc[i-1]['timestamp']
-                current_incident['duration_min'] = max(1, round((current_incident['end_time'] - current_incident['start_time']).total_seconds() / 60))
-                incidents.append(current_incident)
-                current_incident = None
-        
-        if status in ['GANGGUAN_ISP', 'GANGGUAN_LOKAL']:
-            if current_incident is None:
-                current_incident = {
-                    'start_time': ts,
-                    'end_time': ts,
-                    'type': 'Dugaan ISP (Biznet)' if status == 'GANGGUAN_ISP' else 'Dugaan Lokal (Router/AP)',
-                    'status_code': status,
-                    'count': 1
-                }
-            else:
-                current_incident['end_time'] = ts
-                current_incident['count'] += 1
-        else:
-            if current_incident is not None:
-                current_incident['duration_min'] = max(1, round((current_incident['end_time'] - current_incident['start_time']).total_seconds() / 60))
-                incidents.append(current_incident)
-                current_incident = None
-                
-    if current_incident is not None:
-        current_incident['duration_min'] = max(1, round((current_incident['end_time'] - current_incident['start_time']).total_seconds() / 60))
-        incidents.append(current_incident)
-        
-    return incidents
+@st.cache_resource
+def prepare_database():
+    init_db()
+    return True
 
-# --- HEADER APLIKASI ---
-st.title("📶 Pencatat Gangguan Wi-Fi Kos Mahasiswa")
-st.caption("Studi Kasus: PTS Kost, Cisitu, Bandung · Tugas UTS Kapita Selekta Telekomunikasi ITB")
 
-df_ping, df_comp = load_data()
+def parse_complaint_time(value):
+    if not value:
+        return pd.NaT
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
+    if pd.notna(parsed) and parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
 
-# Sidebar: Filter & Aksi Cepat
-with st.sidebar:
-    st.header("⚙️ Kontrol & Form")
-    auto_refresh = st.checkbox("Auto Refresh (Deteksi otomatis)", value=False)
-    if auto_refresh:
-        st.info("Pembaruan data aktif...")
-        # Auto rerun Streamlit
-        import time
-        time.sleep(5)
-        st.rerun()
 
-    st.markdown("---")
-    st.subheader("📝 Catat Keluhan Penghuni")
-    with st.form("form_keluhan"):
-        nama_input = st.text_input("Nama (opsional)", placeholder="cth: Ridho")
-        lantai_input = st.selectbox("Lantai Kamar", ["Lantai 1", "Lantai 2", "Lantai 3"])
-        perangkat_input = st.selectbox("Perangkat Digunakan", ["HP Android", "HP iOS (iPhone)", "Laptop"])
-        gejala_input = st.text_input("Gejala", placeholder="cth: Tidak bisa browsing / lemot")
-        dampak_input = st.text_input("Dampak", placeholder="cth: Kuliah online terhenti")
-        submitted = st.form_submit_button("Kirim Keluhan")
-        
-        if submitted:
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("""
-                INSERT INTO complaints (timestamp, nama, lantai, perangkat, gejala, dampak)
-                VALUES (datetime('now', 'localtime'), ?, ?, ?, ?, ?)
-            """, (nama_input or "Anonim", lantai_input, perangkat_input, gejala_input or "Koneksi mati", dampak_input or "-"))
-            conn.commit()
-            conn.close()
-            st.success("Keluhan tersimpan!")
-            st.rerun()
+def load_data(since):
+    with closing(get_connection()) as connection:
+        ping_rows = connection.execute(
+            """
+            SELECT * FROM ping_logs
+            WHERE timestamp >= ? ORDER BY timestamp, id
+            """,
+            (since.isoformat(sep=" ", timespec="seconds"),),
+        ).fetchall()
+        complaints = [dict(row) for row in connection.execute(
+            "SELECT timestamp, nama, lantai, perangkat, gejala, dampak FROM complaints ORDER BY id DESC"
+        )]
 
-# --- STATUS REALTIME & METRIK ---
-if df_ping.empty:
-    st.warning("⚠️ Belum ada data ping di database. Pastikan `python monitor.py` sedang berjalan di terminal!")
-else:
-    latest = df_ping.iloc[-1]
-    last_seen_delta = (datetime.now() - latest['timestamp']).total_seconds()
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    # 1. Status Terakhir
-    status_label = latest['status']
-    if last_seen_delta > 20:
-        col1.metric("Status Sistem", "💤 Laptop Mati/Sleep", delta=f"Jeda {int(last_seen_delta)}d", delta_color="inverse")
-    elif status_label == "NORMAL":
-        col1.metric("Status Wi-Fi", "🟢 NORMAL", delta="Koneksi Lancar")
-    elif status_label == "GANGGUAN_ISP":
-        col1.metric("Status Wi-Fi", "🔴 GANGGUAN ISP", delta="Internet Down (Router OK)", delta_color="inverse")
+    if complaints:
+        frame = pd.DataFrame(complaints)
+        # Import lama menyimpan format CSV mentah, jadi tangani lebih dari satu format.
+        parsed = frame["timestamp"].map(parse_complaint_time)
+        frame = frame.loc[parsed.isna() | (parsed >= since)].copy()
+        unparsed = parsed.loc[frame.index].isna()
+        frame.loc[unparsed, "timestamp"] = frame.loc[unparsed, "timestamp"].astype(str) + " (cek format waktu)"
     else:
-        col1.metric("Status Wi-Fi", "🟠 GANGGUAN LOKAL", delta="Router Down", delta_color="inverse")
+        frame = pd.DataFrame()
+    return ping_rows, frame
 
-    # 2. Latency Router
-    r_lat = latest['router_ping']
-    col2.metric("Latency Router Lokal", f"{r_lat:.1f} ms" if pd.notnull(r_lat) else "TIMEOUT")
 
-    # 3. Latency Internet
-    i_lat = latest['internet_ping']
-    col3.metric("Latency Internet (1.1.1.1)", f"{i_lat:.1f} ms" if pd.notnull(i_lat) else "TIMEOUT")
+def format_duration(seconds):
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} j {minutes} m {seconds} d" if hours else f"{minutes} m {seconds} d"
 
-    # 4. Total Log Terkumpul
-    col4.metric("Total Sampel Ping", f"{len(df_ping)} baris", delta=f"Interval 5s")
 
-    st.markdown("---")
+def probe_text(result, rtt):
+    if result is None:
+        return "—" if rtt is None else f"{rtt:g} ms"
+    labels = {"OK": "Merespons", "TIDAK_MERESPONS": "Tidak merespons",
+              "GAGAL_KIRIM": "Gagal dikirim / tujuan tak terjangkau",
+              "ERROR_UKUR": "Pengukuran bermasalah"}
+    return f"{rtt:g} ms" if rtt is not None else labels[result]
 
-    # --- TABS NAVIGASI UTAMA ---
-    tab_grafik, tab_insiden, tab_keluhan, tab_laporan = st.tabs([
-        "📊 Grafik Latensi & Riwayat", 
-        "⚠️ Ringkasan Insiden (Downtime)", 
-        "📋 Data Keluhan Penghuni", 
-        "📄 Draf Laporan Pengelola (WhatsApp/Cetak)"
-    ])
 
-    with tab_grafik:
-        st.subheader("Aktivitas Latensi Jaringan (Waktu Nyata)")
-        
-        # Batasi tampilan untuk grafik (misal 300 data poin terakhir agar cepat)
-        df_display = df_ping.tail(300).copy()
-        
-        fig = go.Figure()
-        # Garis Latensi Router
+def show_latency(rows, timestamps):
+    series = (
+        ("Gateway", "router_ping"),
+        (INTERNET_TARGET, "internet_ping"),
+        (BACKUP_TARGET, "backup_ping"),
+    )
+    recent = list(zip(timestamps[-300:], rows[-300:]))
+    x_values = []
+    y_values = {column: [] for _, column in series}
+    for timestamp, row in recent:
+        if x_values and (timestamp - x_values[-1]).total_seconds() > GAP_SECONDS:
+            x_values.append(timestamp)
+            for values in y_values.values():
+                values.append(None)
+        x_values.append(timestamp)
+        for _, column in series:
+            y_values[column].append(row[column])
+    fig = go.Figure()
+    for label, column in series:
         fig.add_trace(go.Scatter(
-            x=df_display['timestamp'], 
-            y=df_display['router_ping'],
-            name='Router Kos (172.16.10.1)',
-            line=dict(color='#2ecc71', width=2),
-            mode='lines+markers'
+            x=x_values, y=y_values[column], name=label, mode="lines+markers", connectgaps=False,
         ))
-        
-        # Garis Latensi Internet
-        fig.add_trace(go.Scatter(
-            x=df_display['timestamp'], 
-            y=df_display['internet_ping'],
-            name='Internet Publik (1.1.1.1)',
-            line=dict(color='#3498db', width=2),
-            mode='lines+markers'
-        ))
-        
-        fig.update_layout(
-            xaxis_title="Waktu",
-            yaxis_title="Latency (ms)",
-            hovermode="x unified",
-            height=400,
-            margin=dict(l=20, r=20, t=30, b=20)
+    fig.update_layout(xaxis_title="Waktu lokal laptop", yaxis_title="RTT (ms)", height=360)
+    st.plotly_chart(fig)
+    st.caption("Maksimal 300 sampel terakhir. Titik kosong menandakan RTT tidak tersedia.")
+
+
+def incident_record(incident):
+    diagnosis = DIAGNOSES[incident.diagnosis_code]
+    evidence = " · ".join(
+        f"{DIAGNOSES[code].title} ({count} sampel)"
+        for code, count in incident.patterns.items()
+    )
+    return {
+        "Mulai teramati": incident.started_at,
+        "Terakhir gagal": incident.last_failed_at,
+        "Pulih teramati": incident.recovered_at,
+        "Durasi teramati": format_duration(incident.observed_seconds),
+        "Status": incident.state,
+        "Indikasi": diagnosis.title,
+        "Pola sampel": evidence,
+        "Yang perlu diperiksa": diagnosis.action,
+    }
+
+
+prepare_database()
+st.title("Pemantauan Wi-Fi PTS Kost")
+st.caption(f"Titik pantau laptop · Gateway terkonfigurasi {ROUTER_IP}")
+
+with st.sidebar:
+    hours = st.selectbox("Rentang tampilan", [6, 24, 48], index=1, format_func=lambda n: f"{n} jam")
+    auto_refresh = st.checkbox("Perbarui dashboard tiap 5 detik", value=True)
+    st.button("Muat ulang data")
+    with st.form("form_keluhan", clear_on_submit=True):
+        st.subheader("Catat keluhan")
+        name = st.text_input("Nama (opsional)")
+        floor = st.selectbox("Lantai kamar", ["Lantai 1", "Lantai 2", "Lantai 3"])
+        device = st.selectbox("Perangkat", ["HP Android", "HP iOS (iPhone)", "Laptop"])
+        symptom = st.text_input("Gejala")
+        impact = st.text_input("Dampak")
+        if st.form_submit_button("Simpan keluhan"):
+            if symptom.strip() and impact.strip():
+                insert_complaint(name.strip() or "Anonim", floor, device, symptom.strip(), impact.strip())
+                st.success("Keluhan tersimpan.")
+            else:
+                st.warning("Isi gejala dan dampak sebelum menyimpan.")
+
+
+@st.fragment(run_every=5 if auto_refresh else None)
+def show_dashboard():
+    now = datetime.now()
+    rows, complaints = load_data(now - timedelta(hours=hours))
+    timestamps = [datetime.fromisoformat(row["timestamp"]) for row in rows]
+    codes = [display_status(row) for row in rows]
+    history = analyze_samples(zip(timestamps, codes), now)
+    st.caption(f"Dashboard terakhir membaca database pukul {now:%H:%M:%S}.")
+    if rows:
+        latest = rows[-1]
+        age = int((now - timestamps[-1]).total_seconds())
+        diagnosis = DIAGNOSES[codes[-1]]
+        if age > GAP_SECONDS:
+            st.warning(f"Data terbaru belum masuk selama {age} detik. Cek terminal monitor.py.")
+        elif history.pending_seconds is not None:
+            st.info(f"Kegagalan sedang diamati ({history.pending_seconds} detik sejak sampel gagal pertama).")
+        elif history.incidents and history.incidents[-1].state in ("Berlangsung", "Menunggu konfirmasi pulih"):
+            incident = history.incidents[-1]
+            st.warning(f"{incident.state} sejak {incident.started_at:%H:%M:%S} · {DIAGNOSES[incident.diagnosis_code].title}")
+        st.caption(f"Sampel terakhir {timestamps[-1]:%d/%m/%Y %H:%M:%S} · {diagnosis.title}")
+        st.write(diagnosis.evidence)
+        if age <= GAP_SECONDS and codes[-1] != "NORMAL":
+            st.write(diagnosis.action)
+        columns = st.columns(4)
+        probes = (
+            ("Gateway", "router_result", "router_ping"),
+            (INTERNET_TARGET, "internet_result", "internet_ping"),
+            (BACKUP_TARGET, "backup_result", "backup_ping"),
         )
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("ℹ️ *Jika garis terputus atau bernilai 0/hilang, terjadi packet loss / timeout pada titik tersebut.*")
+        for col, (label, result, rtt) in zip(columns, probes):
+            col.markdown(f"**{label}**")
+            col.write(probe_text(latest[result], latest[rtt]))
+        columns[3].markdown("**TCP 443**")
+        columns[3].write(probe_text(latest["tcp_result"], None))
+    else:
+        st.warning("Belum ada sampel di rentang tampilan. Jalankan monitor.py di terminal terpisah.")
 
-    with tab_insiden:
-        st.subheader("Daftar Kejadian Gangguan Terdeteksi")
-        incidents = group_incidents(df_ping)
-        
-        if not incidents:
-            st.success("🎉 Tidak ada rekaman insiden gangguan. Koneksi Wi-Fi stabil!")
+    incidents_tab, graph_tab, complaints_tab, report_tab = st.tabs(
+        ["Riwayat downtime", "Pengukuran", "Keluhan", "Laporan pengelola"]
+    )
+    with incidents_tab:
+        st.caption(
+            f"Downtime tercatat setelah sampel gagal beruntun mencakup minimal {MIN_DOWNTIME_SECONDS} detik. "
+            "Pemulihan memerlukan dua sampel yang menunjukkan akses kembali. "
+            "Durasi dihitung dari sampel dalam rentang tampilan."
+        )
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Downtime terkonfirmasi", len(history.incidents))
+        c2.metric("Kegagalan singkat yang kembali normal", history.short_failures)
+        c3.metric("Jeda sampel", len(history.gaps))
+        if history.incidents:
+            st.dataframe([incident_record(item) for item in reversed(history.incidents)], hide_index=True)
+        if history.gaps:
+            st.subheader("Jeda lebih dari 15 detik")
+            st.dataframe([
+                {"Sampel terakhir sebelum jeda": left, "Batas akhir observasi jeda": right,
+                 "Selang antarsampel": format_duration(int((right - left).total_seconds()))}
+                for left, right in reversed(history.gaps)
+            ], hide_index=True)
+    with graph_tab:
+        if rows:
+            show_latency(rows, timestamps)
+            st.dataframe([
+                {"Waktu": ts, "Status": DIAGNOSES[code].title,
+                 "Gateway": probe_text(row["router_result"], row["router_ping"]),
+                 INTERNET_TARGET: probe_text(row["internet_result"], row["internet_ping"]),
+                 BACKUP_TARGET: probe_text(row["backup_result"], row["backup_ping"]),
+                 "TCP 443": probe_text(row["tcp_result"], None)}
+                for ts, code, row in reversed(list(zip(timestamps[-30:], codes[-30:], rows[-30:])))
+            ], hide_index=True)
+    with complaints_tab:
+        if complaints.empty:
+            st.info("Belum ada keluhan pada rentang ini.")
         else:
-            df_inc = pd.DataFrame(incidents)
-            df_inc['Mulai'] = df_inc['start_time'].dt.strftime('%d %b %Y, %H:%M:%S')
-            df_inc['Selesai'] = df_inc['end_time'].dt.strftime('%d %b %Y, %H:%M:%S')
-            df_inc['Durasi'] = df_inc['duration_min'].astype(str) + " Menit"
-            df_inc['Klasifikasi'] = df_inc['type']
-            
-            st.dataframe(
-                df_inc[['Mulai', 'Selesai', 'Durasi', 'Klasifikasi', 'count']].rename(columns={'count': 'Total Ping Gagal'}),
-                use_container_width=True
-            )
-
-    with tab_keluhan:
-        st.subheader("Keluhan Tercatat dari Penghuni PTS Kost")
-        if df_comp.empty:
-            st.info("Belum ada laporan keluhan yang masuk dari penghuni.")
+            st.dataframe(complaints, hide_index=True)
+    with report_tab:
+        counts = Counter(codes)
+        lines = [
+            "LAPORAN PEMANTAUAN WI-FI PTS KOST",
+            f"Rentang tampilan {hours} jam · waktu lokal laptop",
+            f"Downtime terkonfirmasi {len(history.incidents)} kejadian",
+            f"Total durasi downtime teramati {format_duration(sum(item.observed_seconds for item in history.incidents))}",
+            f"Kegagalan singkat yang kembali normal {history.short_failures} kejadian",
+            f"Jeda pengukuran terdeteksi {len(history.gaps)}",
+            f"Sampel dengan bukti terbatas {counts['LEGACY_UNCERTAIN'] + counts['PROBE_ERROR']}",
+            f"Keluhan dalam rentang atau perlu cek waktu {len(complaints)}",
+        ]
+        if timestamps:
+            lines.append(f"Sampel tersedia {timestamps[0]:%d/%m %H:%M:%S} s.d. {timestamps[-1]:%d/%m %H:%M:%S}")
         else:
-            st.dataframe(df_comp[['timestamp', 'nama', 'lantai', 'perangkat', 'gejala', 'dampak']], use_container_width=True)
+            lines.append("Belum ada sampel dalam rentang ini.")
+        if history.incidents:
+            lines.append("Rincian hingga lima downtime terakhir")
+        for incident in history.incidents[-5:]:
+            diagnosis = DIAGNOSES[incident.diagnosis_code]
+            recovery = f" · pulih {incident.recovered_at:%d/%m %H:%M:%S}" if incident.recovered_at else ""
+            lines.extend([
+                "",
+                f"{incident.started_at:%d/%m %H:%M:%S}{recovery} · {incident.state} · {format_duration(incident.observed_seconds)}",
+                diagnosis.title,
+                diagnosis.evidence,
+                incident_record(incident)["Pola sampel"],
+                diagnosis.action,
+            ])
+        st.code("\n".join(lines), language=None)
 
-    with tab_laporan:
-        st.subheader("Format Laporan Siap Kirim untuk Ibu Kos / Teknisi ISP")
-        st.markdown("Kalian dapat langsung menyalin teks ringkasan ini untuk dilaporkan ke pengelola kos:")
-        
-        # Hitung statistik singkat
-        total_logs = len(df_ping)
-        gangguan_isp = len(df_ping[df_ping['status'] == 'GANGGUAN_ISP'])
-        gangguan_lokal = len(df_ping[df_ping['status'] == 'GANGGUAN_LOKAL'])
-        total_gangguan = gangguan_isp + gangguan_lokal
-        uptime_pct = ((total_logs - total_gangguan) / total_logs * 100) if total_logs > 0 else 100
-        
-        sample_keluhan = ""
-        if not df_comp.empty:
-            top_gejala = df_comp['gejala'].mode()[0] if not df_comp['gejala'].empty else "-"
-            sample_keluhan = f"- Gejala terbanyak penghuni: {top_gejala} (Total {len(df_comp)} laporan)"
-        
-        template_pesan = f"""*LAPORAN PEMANTAUAN WI-FI PTS KOST*
-Periode Pantau: {df_ping.iloc[0]['timestamp'].strftime('%d/%m/%Y %H:%M')} s/d {df_ping.iloc[-1]['timestamp'].strftime('%d/%m/%Y %H:%M')}
 
-📊 *Ringkasan Teknis:*
-- Ketersediaan Koneksi (Uptime): {uptime_pct:.2f}%
-- Gangguan Teridentifikasi: {len(group_incidents(df_ping))} kali kejadian
-  • Dugaan Masalah Jalur ISP (Biznet): {gangguan_isp} sampel ping
-  • Dugaan Masalah Perangkat Router/AP Lokal: {gangguan_lokal} sampel ping
-
-👥 *Dampak Penghuni:*
-{sample_keluhan if sample_keluhan else '- Belum ada keluhan kritis tercatat'}
-
-*Rekomendasi:*
-{'Perlu restart/pemeriksaan router fisik kos karena terjadi kendala lokal.' if gangguan_lokal > gangguan_isp else 'Router lokal aman, perlu eskalasi tiket gangguan ke pihak ISP Biznet.'}
-        """
-        
-        st.text_area("Teks Laporan WhatsApp", value=template_pesan, height=260)
+show_dashboard()

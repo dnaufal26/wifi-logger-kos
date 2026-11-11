@@ -1,98 +1,111 @@
-import time
-import subprocess
+import errno
+import os
 import re
-import sys
+import socket
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from database import insert_ping_log, init_db
 
-# Konfigurasi Target
-ROUTER_IP = "172.16.10.1"      # Default gateway PTS Kost dari ipconfig
-INTERNET_TARGET = "1.1.1.1"    # Cloudflare DNS (stabil untuk uji konektivitas ISP)
-INTERVAL_DETIK = 5             # Sesuai rancangan proposal: cek tiap 5 detik
-TIMEOUT_MS = 2000              # Batas waktu timeout (2 detik)
+from database import init_db, insert_ping_log
+from diagnostics import ERROR, NO_REPLY, OK, SEND_FAILED, classify
 
-def ping_host(host, timeout_ms=TIMEOUT_MS):
-    """
-    Melakukan 1 kali ping ke host target di Windows.
-    Mengembalikan latency dalam milidetik (float), atau None jika timeout/loss.
-    Metode ini menggunakan ping bawaan Windows sehingga tidak butuh akses root/admin khusus.
-    """
+ROUTER_IP = os.environ.get("WIFI_LOG_ROUTER", "172.16.10.1")
+INTERNET_TARGET = "1.1.1.1"
+BACKUP_TARGET = "8.8.8.8"
+INTERVAL_DETIK = 5
+PING_TIMEOUT_MS = 1200
+TCP_TIMEOUT_SEC = 1.2
+RTT_PATTERN = re.compile(r"(?:time|waktu)\s*([=<])\s*(\d+)\s*ms", re.I)
+NO_ROUTE = {errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH, 10050, 10051, 10065}
+
+
+def ping_host(host):
+    """Ukur satu ping Windows. Kembalikan (hasil probe, RTT atau None)."""
     try:
-        # Perintah ping Windows: 1 paket (-n 1), batas timeout ms (-w <timeout>)
-        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), host]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=(timeout_ms / 1000.0) + 1.0)
-        
-        output = res.stdout
-        # Cari pola latensi: "time=XXms" atau "waktu=XXms" atau "time<1ms"
-        match = re.search(r'(?:time|waktu)[=<](\d+)ms', output, re.IGNORECASE)
-        if match:
-            return float(match.group(1))
-        
-        # Jika time < 1ms, regex di atas menangkap angka 1, tapi jika ada kasus khusus:
-        if "<1ms" in output.lower():
-            return 0.5
-        
-        # Jika Destination host unreachable atau Request timed out
-        return None
-    except Exception:
-        return None
+        result = subprocess.run(
+            ["ping", "-4", "-n", "1", "-w", str(PING_TIMEOUT_MS), host],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=2.5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ERROR, None
 
-def tentukan_status(router_rtt, internet_rtt):
-    """
-    Memetakan hasil ping ke kategori gangguan sesuai rancangan:
-    - Router OK & Internet OK   -> NORMAL
-    - Router OK & Internet GAGAL -> GANGGUAN_ISP
-    - Router GAGAL & Internet OK -> GANGGUAN_LOKAL (kasus aneh/routing anomali)
-    - Router GAGAL & Internet GAGAL -> GANGGUAN_LOKAL (Wi-Fi lokal putus/down)
-    """
-    if router_rtt is not None and internet_rtt is not None:
-        return "NORMAL"
-    elif router_rtt is not None and internet_rtt is None:
-        return "GANGGUAN_ISP"
-    elif router_rtt is None and internet_rtt is not None:
-        return "GANGGUAN_LOKAL"
-    else:
-        return "GANGGUAN_LOKAL"
+    output = result.stdout.lower()
+    match = RTT_PATTERN.search(output)
+    if match:
+        # Ping Windows menampilkan '<1 ms'. Simpan 0,5 ms sebagai pendekatan.
+        rtt = 0.5 if match[1] == "<" else float(match[2])
+        return OK, rtt
+    if "ttl=" in output:
+        return OK, None
+    if any(term in output for term in (
+        "general failure", "transmit failed", "destination host unreachable",
+        "destination net unreachable", "host tujuan tidak dapat dijangkau",
+    )):
+        return SEND_FAILED, None
+    if "request timed out" in output or "permintaan habis" in output:
+        return NO_REPLY, None
+    return ERROR, None
+
+
+def probe_tcp():
+    """Coba membuka koneksi TCP ke IP publik tanpa bergantung pada DNS."""
+    try:
+        with socket.create_connection((INTERNET_TARGET, 443), timeout=TCP_TIMEOUT_SEC):
+            return OK
+    except TimeoutError:
+        return NO_REPLY
+    except OSError as exc:
+        if exc.errno in NO_ROUTE or getattr(exc, "winerror", None) in NO_ROUTE:
+            return SEND_FAILED
+        return ERROR
+
 
 def main():
     init_db()
-    print("=" * 60)
-    print("📡 SISTEM PENCATAT GANGGUAN WI-FI KOS (PTS Kost Cisitu)")
-    print(f"Target Router   : {ROUTER_IP}")
-    print(f"Target Internet : {INTERNET_TARGET}")
-    print(f"Interval        : Tiap {INTERVAL_DETIK} detik")
-    print("Tekan Ctrl + C di terminal untuk menghentikan monitoring.")
-    print("=" * 60)
-
-    count = 0
+    print(f"Memantau gateway {ROUTER_IP} dan target {INTERNET_TARGET} / {BACKUP_TARGET}.")
+    print("Interval 5 detik. Tekan Ctrl+C untuk berhenti.")
     try:
-        while True:
-            waktu_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Lakukan ping ke kedua target
-            router_rtt = ping_host(ROUTER_IP)
-            internet_rtt = ping_host(INTERNET_TARGET)
-            
-            # Klasifikasikan status
-            status = tentukan_status(router_rtt, internet_rtt)
-            
-            # Simpan ke SQLite
-            insert_ping_log(router_rtt, internet_rtt, status)
-            count += 1
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            next_start = time.monotonic()
+            while True:
+                sampled_at = datetime.now().isoformat(sep=" ", timespec="seconds")
+                router_job = pool.submit(ping_host, ROUTER_IP)
+                primary_job = pool.submit(ping_host, INTERNET_TARGET)
+                backup_job = pool.submit(ping_host, BACKUP_TARGET)
+                router_result, router_rtt = router_job.result()
+                primary_result, primary_rtt = primary_job.result()
+                backup_result, backup_rtt = backup_job.result()
 
-            # Format log tampilan di konsol
-            r_str = f"{router_rtt:5.1f} ms" if router_rtt is not None else "TIMEOUT "
-            i_str = f"{internet_rtt:5.1f} ms" if internet_rtt is not None else "TIMEOUT "
-            
-            # Beri penanda visual jika ada gangguan
-            indikator = "🟢" if status == "NORMAL" else "🔴"
-            print(f"[{waktu_str}] #{count:04d} | Router: {r_str} | Internet: {i_str} | Status: {status} {indikator}")
-            
-            time.sleep(INTERVAL_DETIK)
+                tcp_result = None
+                if OK not in (primary_result, backup_result):
+                    tcp_result = probe_tcp()
+                status = classify(router_result, primary_result, backup_result, tcp_result)
+                insert_ping_log(
+                    router_rtt, primary_rtt, status,
+                    timestamp=sampled_at,
+                    router_result=router_result,
+                    internet_result=primary_result,
+                    backup_ping=backup_rtt,
+                    backup_result=backup_result,
+                    tcp_result=tcp_result,
+                )
+                print(
+                    f"[{sampled_at}] Gateway {router_result} | "
+                    f"1.1.1.1 {primary_result} | 8.8.8.8 {backup_result} | "
+                    f"TCP {tcp_result or '—'} | {status}", flush=True,
+                )
 
+                next_start += INTERVAL_DETIK
+                while next_start < time.monotonic():
+                    next_start += INTERVAL_DETIK
+                time.sleep(max(0, next_start - time.monotonic()))
     except KeyboardInterrupt:
-        print("\n\n[INFO] Monitoring dihentikan oleh pengguna. Data tersimpan rapi di SQLite.")
-        sys.exit(0)
+        print("\nMonitoring dihentikan. Sampel yang sudah tercatat tetap tersimpan.")
+
 
 if __name__ == "__main__":
     main()
